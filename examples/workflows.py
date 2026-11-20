@@ -2,7 +2,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from strataleaf import Database, Archives, Conflict, InvalidDocument, InvalidCursor, ReadOnly, SnapshotTooOld, ReplicationError
+from strataleaf import Database, Archives, Conflict, InvalidDocument, InvalidCursor, ReadOnly, SnapshotTooOld, ReplicationError, jsonable
 
 SCHEMA = {"fields": {"region": "string", "sequence": "integer", "code": "string"}, "required": ["region", "sequence"]}
 
@@ -145,6 +145,97 @@ def run(flow):
                           "duplicate": rejected(lambda: db.transfer.import_lines("copy_segments", exported["lines"]), Conflict)}
                 if len(db.query("copy_segments").records) != 6:
                     raise RuntimeError("logical import differs")
+            elif flow == "projection":
+                db.catalog.create("readings", {"fields": {"region": "string"}, "required": ["region"]})
+                rows = [
+                    ("r01", {"region": "east", "sensor": {"celsius": 20}, "count": 4, "total": 10}),
+                    ("r02", {"region": "west", "sensor": {"celsius": None}, "count": 0, "total": 5}),
+                    ("r03", {"region": "east", "count": 2, "total": "oops"}),
+                    ("r04", {"region": "north", "sensor": {}, "count": 3, "total": 9}),
+                    ("r05", {"region": "east", "sensor": {"celsius": 100}, "count": 1, "total": 1,
+                             "huge": 10 ** 1000}),
+                ]
+                write = db.batch("seed_readings")
+                for key, document in rows:
+                    write.put("readings", key, document)
+                write.commit()
+                projection = {"aliases": [
+                    {"name": "zone", "expression": {"field": "region"}},
+                    {"name": "fahrenheit", "expression": {"op": "add",
+                        "left": {"op": "multiply", "left": {"field": "sensor.celsius"}, "right": {"literal": 1.8}},
+                        "right": {"literal": 32}}},
+                    {"name": "bucket", "expression": {"case": [
+                        {"when": {"field": "sensor.celsius", "op": "ge", "value": 50}, "then": {"literal": "hot"}},
+                        {"when": {"field": "sensor.celsius", "op": "exists", "value": True}, "then": {"literal": "cold"}},
+                        {"default": {"literal": "unknown"}}]}},
+                    {"name": "per_count", "expression": {"op": "divide",
+                        "left": {"field": "total"}, "right": {"field": "count"}}},
+                    {"name": "unavailable", "expression": {"op": "add",
+                        "left": {"field": "sensor.celsius"}, "right": {"literal": 1}}},
+                    {"name": "raw_celsius", "expression": {"field": "sensor.celsius"}},
+                    {"name": "oversized", "expression": {"op": "multiply",
+                        "left": {"field": "huge"}, "right": {"field": "huge"}}},
+                ]}
+                page = db.query("readings", projection=projection, limit=3)
+                second = db.query("readings", projection=projection, limit=3, cursor=page.cursor)
+                rendered = [
+                    {"key": item.key, "values": jsonable(item.values), "errors": list(item.errors)}
+                    for item in [*page.records, *second.records]
+                ]
+                expected_states = {
+                    "r01": {"fahrenheit": 68.0, "bucket": "cold", "per_count": 2.5, "unavailable": 21, "raw_celsius": 20},
+                    "r02": {"fahrenheit": {"$state": "not_applicable"}, "bucket": "cold",
+                            "per_count": {"$state": "not_applicable"}, "unavailable": {"$state": "not_applicable"},
+                            "raw_celsius": None},
+                    "r03": {"per_count": {"$state": "not_applicable"},
+                            "unavailable": {"$state": "missing"},
+                            "raw_celsius": {"$state": "missing"}},
+                    "r04": {"fahrenheit": {"$state": "missing"}, "bucket": "unknown",
+                            "per_count": 3.0, "unavailable": {"$state": "missing"},
+                            "raw_celsius": {"$state": "missing"}},
+                    "r05": {"fahrenheit": 212.0, "bucket": "hot", "per_count": 1.0, "unavailable": 101,
+                            "raw_celsius": 100, "oversized": {"$state": "not_applicable"}},
+                }
+                by_key = {item["key"]: item for item in rendered}
+                for key, expected in expected_states.items():
+                    for alias, want in expected.items():
+                        if by_key[key]["values"][alias] != want:
+                            raise RuntimeError(f"projection mismatch for {key}.{alias}")
+                if not page.complete or second.complete:
+                    raise RuntimeError("page completeness must follow per-record evaluation failures")
+                if page.failures or second.failures[0]["key"] != "r05" or second.failures[0]["alias"] != "oversized":
+                    raise RuntimeError("failure details must stay attached to their page and record")
+                # Filtering, key ordering and projection share one fixed read view.
+                snapshot = page.revision
+                db.batch().delete("readings", "r01").commit()
+                east = db.query("readings", {"field": "region", "op": "eq", "value": "east"},
+                                projection=projection, revision=snapshot, limit=10)
+                if east.revision != snapshot or [item.key for item in east.records] != ["r01", "r03", "r05"]:
+                    raise RuntimeError("projected query did not honor the fixed read view")
+                # A cursor is bound to its full query fingerprint, projection included.
+                foreign = rejected(lambda: db.query("readings", limit=3, cursor=page.cursor), InvalidCursor)
+                deep = {"op": "add", "left": {"literal": 1}, "right": {"literal": 1}}
+                for _ in range(130):
+                    deep = {"op": "add", "left": deep, "right": deep}
+                invalid = [
+                    lambda: db.query("readings", projection={"aliases": [
+                        {"name": "bad", "expression": {"field": "sensor..celsius"}}]}),
+                    lambda: db.query("readings", projection={"aliases": [
+                        {"name": "bad", "expression": deep}]}),
+                    lambda: db.query("readings", projection={"aliases": [
+                        {"name": "bad", "expression": {"eval": "__import__('os')"}}]}),
+                ]
+                rejections = [rejected(call, InvalidDocument) for call in invalid]
+                # The projection-less query path is unchanged and remains complete.
+                plain = db.query("readings", limit=10, revision=snapshot)
+                if not plain.complete or plain.failures or any(not hasattr(item, "document") for item in plain.records):
+                    raise RuntimeError("plain query behavior changed")
+                output = {"revision": snapshot, "records": rendered,
+                          "first_page_complete": page.complete, "first_page_failures": page.failures,
+                          "second_page_complete": second.complete, "failures": second.failures,
+                          "plan": {**page.plan, "failures": page.plan["failures"]},
+                          "foreign_cursor": foreign, "invalid_expressions": rejections,
+                          "plain_keys": [item.key for item in plain.records]}
             else:
                 raise ValueError("unknown example workflow: " + flow)
             print(json.dumps({"workflow": flow, "result": output}, ensure_ascii=False, sort_keys=True, default=str))

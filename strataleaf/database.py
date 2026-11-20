@@ -40,8 +40,9 @@ class Database:
     def get(self, collection, key, revision=None):
         return read_record(self._store, collection, key, revision)
 
-    def query(self, collection, predicate=None, limit=100, cursor=None, revision=None, force_scan=False):
-        return self._queries.select(collection, predicate, limit, cursor, revision, force_scan)
+    def query(self, collection, predicate=None, projection=None, limit=100, cursor=None,
+              revision=None, force_scan=False):
+        return self._queries.select(collection, predicate, projection, limit, cursor, revision, force_scan)
 
     def patch(self, collection, key, patch, expected=None):
         return patch_document(self._store, collection, key, patch, expected)
